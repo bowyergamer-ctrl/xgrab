@@ -6,7 +6,12 @@ Run:
     python app.py
 Then open http://localhost:5000
 """
+import hmac
+import os
 import re
+import struct
+import tempfile
+import zlib
 from urllib.parse import urlparse
 
 import requests
@@ -14,6 +19,39 @@ import yt_dlp
 from flask import Flask, Response, jsonify, request, stream_with_context
 
 app = Flask(__name__)
+
+
+# ---- Optional: log in as you, so age-restricted ("sensitive") posts work ----
+# Set X_AUTH_TOKEN and X_CT0 (cookie values from a logged-in x.com session) as
+# environment variables on your host. Treat them like a password.
+def build_cookie_file():
+    token, ct0 = os.environ.get("X_AUTH_TOKEN", "").strip(), os.environ.get("X_CT0", "").strip()
+    if not (token and ct0):
+        return None
+    lines = ["# Netscape HTTP Cookie File"]
+    for domain in (".x.com", ".twitter.com"):
+        for name, value in (("auth_token", token), ("ct0", ct0)):
+            lines.append(f"{domain}\tTRUE\t/\tTRUE\t2000000000\t{name}\t{value}")
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    with os.fdopen(fd, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
+
+
+COOKIE_FILE = build_cookie_file()
+
+
+# ---- Optional: password gate, so strangers can't use your login ----
+# Set XGRAB_PASSWORD to turn it on. The username can be anything.
+@app.before_request
+def require_password():
+    wanted = os.environ.get("XGRAB_PASSWORD")
+    if not wanted:
+        return None
+    auth = request.authorization
+    if auth and hmac.compare_digest((auth.password or "").encode(), wanted.encode()):
+        return None
+    return Response("Password required", 401, {"WWW-Authenticate": 'Basic realm="xgrab"'})
 
 ALLOWED_POST_HOSTS = {"x.com", "twitter.com", "mobile.twitter.com", "www.x.com", "www.twitter.com"}
 ALLOWED_MEDIA_HOSTS = {"video.twimg.com"}
@@ -32,11 +70,15 @@ def info():
         return jsonify(error="That doesn't look like an X or Twitter link."), 400
 
     opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    if COOKIE_FILE:
+        opts["cookiefile"] = COOKIE_FILE
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             data = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as e:
         msg = str(e)
+        if re.search(r"NSFW|age-restricted|sensitive|authentication", msg, re.I) and not COOKIE_FILE:
+            return jsonify(error="This post is age-restricted. Add your X login cookies to the server to download it."), 403
         if "No video" in msg:
             return jsonify(error="This post has no video."), 404
         return jsonify(error="Couldn't read that post. It may be private, deleted, or age-restricted."), 422
@@ -88,12 +130,78 @@ def home():
     return PAGE
 
 
+@app.get("/manifest.webmanifest")
+def manifest():
+    return jsonify({
+        "name": "xgrab",
+        "short_name": "xgrab",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#10171d",
+        "theme_color": "#1f5eff",
+        "icons": [
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+        ],
+        # Lets you pick xgrab in Android's Share menu from the X app
+        "share_target": {
+            "action": "/",
+            "method": "GET",
+            "params": {"title": "title", "text": "text", "url": "url"},
+        },
+    })
+
+
+def make_icon(size: int) -> bytes:
+    """Draw a blue square with a white download arrow, as PNG bytes (no image files needed)."""
+    bg, fg, c = (31, 94, 255), (255, 255, 255), size / 2
+    rows = []
+    for y in range(size):
+        row = bytearray([0])
+        for x in range(size):
+            u, v = (x - c) / size, (y - c) / size
+            on = (
+                (abs(u) < 0.06 and -0.22 < v < 0.06)      # shaft
+                or (0.0 <= v < 0.2 and abs(u) < 0.2 - v)  # head
+                or (0.17 < v < 0.25 and abs(u) < 0.24)    # tray
+            )
+            row += bytes(fg if on else bg)
+        rows.append(bytes(row))
+
+    def chunk(tag, data):
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 9))
+            + chunk(b"IEND", b""))
+
+
+ICONS = {192: make_icon(192), 512: make_icon(512)}
+
+
+@app.get("/icon-<int:size>.png")
+def icon(size):
+    if size not in ICONS:
+        return "Not found", 404
+    return Response(ICONS[size], content_type="image/png")
+
+
+@app.get("/sw.js")
+def service_worker():
+    js = "self.addEventListener('install',()=>self.skipWaiting());self.addEventListener('fetch',()=>{});"
+    return Response(js, content_type="text/javascript")
+
+
 PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>xgrab: save videos from X</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#1f5eff">
 <style>
   :root {
     --paper: #eef1f4;
@@ -183,6 +291,17 @@ PAGE = r"""<!doctype html>
 const f = document.getElementById("f"), u = document.getElementById("u"),
       go = document.getElementById("go"), msg = document.getElementById("msg"),
       out = document.getElementById("out");
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js");
+
+// Opened from Android's Share menu: pull the link out and start right away
+const q = new URLSearchParams(location.search);
+const shared = (q.get("url") || q.get("text") || "").match(/https?:\/\/\S+/);
+if (shared) {
+  u.value = shared[0];
+  history.replaceState(null, "", "/");
+  setTimeout(() => f.requestSubmit(), 0);
+}
 
 function say(text, isError) { msg.textContent = text; msg.className = isError ? "error" : ""; }
 
