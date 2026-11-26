@@ -22,10 +22,18 @@ app = Flask(__name__)
 
 
 # ---- Optional: log in as you, so age-restricted ("sensitive") posts work ----
-# Set X_AUTH_TOKEN and X_CT0 (cookie values from a logged-in x.com session) as
-# environment variables on your host. Treat them like a password.
+# One environment variable on your host, XGRAB_CONFIG, written as:
+#     password|auth_token|ct0
+# (a password you choose, then the auth_token and ct0 cookie values from a
+# logged-in x.com session, separated by | characters). Treat it like a password.
+_parts = [part.strip() for part in os.environ.get("XGRAB_CONFIG", "").split("|")]
+CFG_PASSWORD = _parts[0] or None
+CFG_TOKEN = _parts[1] if len(_parts) > 1 else ""
+CFG_CT0 = _parts[2] if len(_parts) > 2 else ""
+
+
 def build_cookie_file():
-    token, ct0 = os.environ.get("X_AUTH_TOKEN", "").strip(), os.environ.get("X_CT0", "").strip()
+    token, ct0 = CFG_TOKEN, CFG_CT0
     if not (token and ct0):
         return None
     lines = ["# Netscape HTTP Cookie File"]
@@ -42,10 +50,10 @@ COOKIE_FILE = build_cookie_file()
 
 
 # ---- Optional: password gate, so strangers can't use your login ----
-# Set XGRAB_PASSWORD to turn it on. The username can be anything.
+# Turns on when XGRAB_CONFIG starts with a password. The username can be anything.
 @app.before_request
 def require_password():
-    wanted = os.environ.get("XGRAB_PASSWORD")
+    wanted = CFG_PASSWORD
     if not wanted:
         return None
     auth = request.authorization
